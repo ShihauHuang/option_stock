@@ -86,6 +86,9 @@ def get_call_and_put(final_time, week_code):
 
         common_strike_price = sorted(set(Put_dict.keys()) & set(Call_dict.keys())) # 把相同的履約價提出
 
+        _put = None
+        _call = None
+
         for sp in common_strike_price:
             if Call_dict[sp] > Put_dict[sp]: # 便宜履約價 case
                 next_sp = sp+TICKS
@@ -93,11 +96,15 @@ def get_call_and_put(final_time, week_code):
                     if Call_dict[next_sp] < Put_dict[next_sp]: # 如果昂貴履約價的 Call 小於 Put
                         print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
                         print(f"{'C':<5}{Call_dict[next_sp]:<10}{next_sp:<10}{Put_dict[next_sp]:>5}{'P':>5}")
+                        _put = {sp: Put_dict[sp]}
+                        _call = {next_sp: Call_dict[next_sp]}
                         break
                 elif next_sp in Call_dict: # 單一確認昂貴履約價的 Call
                     if Call_dict[next_sp] <= Put_dict[sp]: # 昂貴履約價只有 C 成交，同時昂貴 C <= 便宜 P
                         print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
                         print(f"{'C':<5}{Call_dict[next_sp]:<10}{next_sp:<10}{'NaN':>5}{'P':>5}")
+                        _put = {sp: Put_dict[sp]}
+                        _call = {next_sp: Call_dict[next_sp]}                        
                         break
 
             elif Call_dict[sp] < Put_dict[sp]: # 昂貴履約價 case
@@ -106,11 +113,15 @@ def get_call_and_put(final_time, week_code):
                     if Call_dict[prev_sp] > Put_dict[prev_sp]: # 如果昂貴履約價的 Call 大於 Put
                         print(f"{'C':<5}{Call_dict[prev_sp]:<10}{prev_sp:<10}{Put_dict[prev_sp]:>5}{'P':>5}")
                         print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
+                        _put = {prev_sp: Put_dict[prev_sp]}
+                        _call = {sp: Call_dict[sp]}                        
                         break
                 elif prev_sp in Put_dict: # 單一確認便宜履約價的 Put
                     if Call_dict[sp] >= Put_dict[prev_sp]: # 便宜履約價只有 P 成交，同時昂貴 C >= 便宜 P
                         print(f"{'C':<5}{'NaN':<10}{prev_sp:<10}{Put_dict[prev_sp]:>5}{'P':>5}")
                         print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
+                        _put = {prev_sp: Put_dict[prev_sp]}
+                        _call = {sp: Call_dict[sp]}                         
                         break
         else:
             print(f"{_t} - 無法找到符合項目")
@@ -118,16 +129,20 @@ def get_call_and_put(final_time, week_code):
 
         break
 
+    return _put, _call
+
 
 
 if __name__ == "__main__":
 
-    # get_option_daily_zip()
-    # unpack_archive(f"Options/{zip_filename}", "Options") # 解壓縮
+    get_option_daily_zip()
+    unpack_archive(f"Options/{zip_filename}", "Options") # 解壓縮
     week_code_for_0900, week_code_for_1330 = get_week_code(today)
-    get_call_and_put(OPEN_TIME, week_code_for_0900)
+    put_0900, call_0900 = get_call_and_put(OPEN_TIME, week_code_for_0900)
+    put_1330, call_1330 = get_call_and_put(CLOSE_TIME, week_code_for_1330)
 
-    get_call_and_put(CLOSE_TIME, week_code_for_1330)
-
-
+    print(f"{put_0900=}")
+    print(f"{call_0900=}")
+    print(f"{put_1330=}")
+    print(f"{call_1330=}")
 
