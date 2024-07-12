@@ -227,6 +227,7 @@ def get_settlement_price(date):
 
 if __name__ == "__main__":
 
+    os.makedirs("Options", exist_ok=True)
     wb = load_workbook("Options.xlsx")
     try:
         wb.save("Options.xlsx")
