@@ -1,3 +1,4 @@
+import json
 import os
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -11,9 +12,14 @@ from time import sleep
 
 MAX_RETRIES = 5
 TICKS = 50
-OPEN_TIME = 90000
-CLOSE_TIME = 133000
-MAX_SEARCH_RANGE = 300
+TIME_090000 = {
+    "start" : 90000, 
+    "end" : 90300
+}
+TIME_133000 = {
+    "start" : 133000,
+    "end" : 133300
+}
 
 def find_latest_date_in_excel(sheet) -> datetime:
     latest_date = None
@@ -44,12 +50,10 @@ def get_previous_30_trading_days() -> list:
             for data in datas:
                 dates_30.append(data.text)
             print(f"{dates_30=}")
-
-            # dates_30=['2024/07/12', '2024/07/11', ... , '2024/05/31'] 總共 30 天
             return dates_30
 
         except Exception as e:
-            print(f"重新取得中 ... {retry+1}/{MAX_RETRIES}")
+            print(f"重新取得中 ({e})... {retry+1}/{MAX_RETRIES}")
             sleep(3)
     else:
         print("資料取得失敗")
@@ -68,11 +72,51 @@ def get_option_daily_zip(zip_filename):
             print(f"{zip_filename} 下載成功 !")
             return
         except Exception as e:
-            print(f"重新下載中 ... {retry+1}/{MAX_RETRIES}")
+            print(f"重新下載中 ({e})... {retry+1}/{MAX_RETRIES}")
             sleep(3)
     else:
         print("下載資料失敗")
         os._exit(1)
+
+
+def get_twse_open_close(dates):
+    current_month = None
+    datas = {}
+    for _d in dates:
+        _date = datetime.strptime(_d, "%Y/%m/%d")
+        _month = _date.month
+        if current_month == _month:
+            continue
+        current_month = _month
+        first_day_of_month = _date.replace(day=1).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date={first_day_of_month}&response=json"
+        print(f"開始取得前 {current_month} 月，加權指數價格 {url} ...")
+        for retry in range(MAX_RETRIES):
+            try:
+                res = get(url, timeout=10)
+                res.raise_for_status()
+                res = json.loads(res.text)
+
+                for row in res["data"]:
+                    # row = ['113/07/01', '23,042.70', '23,187.88', '23,015.17', '23,058.57']
+                    bc_date = row[0].split("/")
+                    bc_date[0] = str(int(bc_date[0]) + 1911)
+                    bc_date = "/".join(bc_date)
+
+                    _open = row[1].replace(",","").split(".")[0]
+                    _close = row[4].replace(",","").split(".")[0]
+
+                    datas[bc_date] = {"open": _open, "close": _close}
+                break
+
+            except Exception as e:
+                print(f"重新取得中 ({e})... {retry+1}/{MAX_RETRIES}")
+                sleep(3)
+        else:
+            print("資料取得失敗")
+            os._exit(1)
+        sleep(3)
+    return datas
 
 
 def get_week_code(date, for_1330=True):
@@ -101,92 +145,107 @@ def get_week_code(date, for_1330=True):
         return week_code_for_0900
 
 
-def get_call_and_put(final_time, week_code, csv_filename):
+def get_call_and_put(specific_date, _type, week_code, csv_filename, twse_dict, search_range):
     df = pd.read_csv(csv_filename, encoding="big5", low_memory=False)
 
     df.columns = df.columns.str.strip()  # 去除欄位名稱的空格
     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)  # 去除每個欄位值的空格
 
-    for _t in range(final_time, final_time+MAX_SEARCH_RANGE):
-        print(f"當前成交時間 = {_t}")
-        filtered_df = df[(df['商品代號'] == 'TXO') & (df['成交時間'] == _t) & (df['到期月份(週別)'] == week_code)]
+    twse_point = int(twse_dict[specific_date][_type])
+    print(f"{specific_date} 大盤 {_type} 為: {twse_point}" )
+    strike_lists = []
+    remains = twse_point % TICKS
 
-        Call_dict = {}
-        Put_dict = {}
+    for i in range(0, 6):
+        strike_lists.append(twse_point + (TICKS - remains) + TICKS * i)
+        strike_lists.append(twse_point - remains - TICKS * i)
+    if remains == 0:
+        strike_lists.append(twse_point)
 
-        for index, row in filtered_df.iterrows():
-            strike_price = int(row["履約價格"])
-            final_price = row["成交價格"]
-            if row["買賣權別"] == "C":
-                if strike_price in Call_dict:
-                    if final_price < Call_dict[strike_price]: # 同履約價，但成交價更小，則替換
-                        Call_dict[strike_price] = final_price
-                else:
-                    Call_dict[strike_price] = final_price
+    strike_lists.sort()
 
-            elif row["買賣權別"] == "P":
-                if strike_price in Put_dict:
-                    if final_price > Put_dict[strike_price]: # 同履約價，但成交價更大，則替換
-                        Put_dict[strike_price] = final_price
-                else:
-                    Put_dict[strike_price] = final_price
+    print(f"取的 {strike_lists} 的 Call 與 Put 數值")
 
-        common_strike_price = sorted(set(Put_dict.keys()) & set(Call_dict.keys())) # 把相同的履約價提出
+    last_strike, last_call_deal, last_put_deal = 0, 0, 0
+    call_strike, call_deal, put_strike, put_deal = 0, 0, 0, 0
 
-        call_strike = None
-        call_deal = None         
-        put_strike = None
-        put_deal = None
+    for current_strike in strike_lists:
+        
+        filtered_df = df[(df['商品代號'] == 'TXO') & (df['履約價格'] == current_strike) & (df['到期月份(週別)'] == week_code) & (df['成交時間'] >= search_range["start"]) & (df['成交時間'] <= search_range["end"])]
+        
+        call_min = filtered_df[filtered_df['買賣權別'] == 'C']["成交價格"].min()
+        put_max = filtered_df[filtered_df['買賣權別'] == 'P']["成交價格"].max()
 
-        for sp in common_strike_price:
-            if Call_dict[sp] > Put_dict[sp]: # 便宜履約價 case
-                next_sp = sp+TICKS
-                if all(next_sp in _dict for _dict in [Call_dict, Put_dict]): # 下一個 tick 有 Call 跟 Put
-                    if Call_dict[next_sp] < Put_dict[next_sp]: # 如果昂貴履約價的 Call 小於 Put
-                        print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
-                        print(f"{'C':<5}{Call_dict[next_sp]:<10}{next_sp:<10}{Put_dict[next_sp]:>5}{'P':>5}")
-                        call_strike = next_sp
-                        call_deal = Call_dict[next_sp]
-                        put_strike = sp
-                        put_deal = Put_dict[sp]
-                        break
-                elif next_sp in Call_dict: # 單一確認昂貴履約價的 Call
-                    if Call_dict[next_sp] <= Put_dict[sp]: # 昂貴履約價只有 C 成交，同時昂貴 C <= 便宜 P
-                        print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
-                        print(f"{'C':<5}{Call_dict[next_sp]:<10}{next_sp:<10}{'NaN':>5}{'P':>5}")
-                        call_strike = next_sp
-                        call_deal = Call_dict[next_sp]
-                        put_strike = sp
-                        put_deal = Put_dict[sp]
-                        break
-
-            elif Call_dict[sp] < Put_dict[sp]: # 昂貴履約價 case
-                prev_sp = sp-TICKS
-                if all(prev_sp in _dict for _dict in [Call_dict, Put_dict]): # 上一個 tick 有 Call 跟 Put
-                    if Call_dict[prev_sp] > Put_dict[prev_sp]: # 如果昂貴履約價的 Call 大於 Put
-                        print(f"{'C':<5}{Call_dict[prev_sp]:<10}{prev_sp:<10}{Put_dict[prev_sp]:>5}{'P':>5}")
-                        print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
-                        call_strike = sp
-                        call_deal = Call_dict[sp]
-                        put_strike = prev_sp
-                        put_deal = Put_dict[prev_sp]
-                        break
-                elif prev_sp in Put_dict: # 單一確認便宜履約價的 Put
-                    if Call_dict[sp] >= Put_dict[prev_sp]: # 便宜履約價只有 P 成交，同時昂貴 C >= 便宜 P
-                        print(f"{'C':<5}{'NaN':<10}{prev_sp:<10}{Put_dict[prev_sp]:>5}{'P':>5}")
-                        print(f"{'C':<5}{Call_dict[sp]:<10}{sp:<10}{Put_dict[sp]:>5}{'P':>5}")
-                        call_strike = sp
-                        call_deal = Call_dict[sp]
-                        put_strike = prev_sp
-                        put_deal = Put_dict[prev_sp]
-                        break
+        if last_call_deal > last_put_deal and put_max > call_min:
+            call_strike = current_strike
+            call_deal = call_min
+            put_strike = last_strike
+            put_deal = last_put_deal
+            break
         else:
-            print(f"{_t} - 無法找到符合項目")
-            continue
-
-        break
+            last_strike = current_strike
+            last_call_deal = call_min if str(call_min) != "nan" else last_call_deal
+            last_put_deal = put_max if str(put_max) != "nan" else last_put_deal
 
     return call_strike, call_deal, put_strike, put_deal
+
+
+def get_call_and_put_special(df, week_code, final_time, Call_dict, Put_dict):
+    """
+    如果基本方式找不到,則使用以下
+    抓取當下時間的最小與最大履約金,
+    並依照每個 tick 迴圈,
+    將每個履約價的 C 與 P 補齊，
+    補齊方法為, 從 final_time["start"] 開始判斷有無
+    """
+    min_strike_price = min(list(Call_dict) + list(Put_dict))
+    max_strike_price = max(list(Call_dict) + list(Put_dict))
+    print(f"{min_strike_price=}")
+    print(f"{max_strike_price=}")
+
+    for _sp in range(min_strike_price, max_strike_price+1, TICKS):
+        if _sp not in Call_dict: 
+            search_time = final_time["start"] # 從一開始找
+            print(f"補 {_sp} 到 Call ===================================")
+            while search_time <= final_time["end"]:
+                search_time_int = int(search_time.strftime('%H%M%S'))
+                # print(f"當前查找時間 = {search_time_int}")
+
+                filtered_df = df[(df['商品代號'] == 'TXO') & (df['買賣權別'] == 'C') & (df['成交時間'] == search_time_int) & (df['到期月份(週別)'] == week_code) & (df['履約價格'] == int(_sp))]
+                if not filtered_df.empty:
+                    final_price = filtered_df.loc[filtered_df['成交價格'].idxmin()]['成交價格']
+                    # print(filtered_df.to_dict())
+                    # print(final_price)
+                    Call_dict[int(_sp)] = final_price
+                    break
+                
+                search_time += timedelta(seconds=1)
+            else:
+                # 會走到這邊代表這一分鐘內 根本沒有 這個履約價，直接給予 0
+                return False
+
+        # if _sp not in Put_dict: 
+        #     search_time = final_time["start"] # 從一開始找
+        #     print(f"補 {_sp} 到 Put ===================================")
+        #     while search_time <= final_time["end"]:
+        #         search_time_int = int(search_time.strftime('%H%M%S'))
+        #         # print(f"當前查找時間 = {search_time_int}")
+
+        #         filtered_df = df[(df['商品代號'] == 'TXO') & (df['買賣權別'] == 'P') & (df['成交時間'] == search_time_int) & (df['到期月份(週別)'] == week_code) & (df['履約價格'] == int(_sp))]
+        #         if not filtered_df.empty:
+        #             final_price = filtered_df.loc[filtered_df['成交價格'].idxmax()]['成交價格']
+        #             # print(filtered_df.to_dict())
+        #             # print(final_price)
+        #             Put_dict[int(_sp)] = final_price
+        #             break
+                
+        #         search_time += timedelta(seconds=1)
+        #     else:
+        #         return False
+
+    print(Call_dict)
+    # return Call_dict, Put_dict
+    os._exit(1)
 
 
 def get_settlement_price(date):
@@ -198,9 +257,9 @@ def get_settlement_price(date):
         "commodityIds": "2",
         "_all": "on",
         "start_year": str(date.year),
-        "start_month": f"{excel_latest_date.month:02d}",
+        "start_month": f"{date.month:02d}",
         "end_year": str(date.year),
-        "end_month": f"{excel_latest_date.month:02d}",
+        "end_month": f"{date.month:02d}",
         "button": "送出查詢",
     }
     print(f"開始取得 {date_str} 結算價 - {url} ...")
@@ -216,9 +275,10 @@ def get_settlement_price(date):
                     settlement_price = int(data.find_all("td")[2].text)
                     print(f"{date_str} 結算價為 {settlement_price}")
                     return settlement_price
+            raise
  
         except Exception as e:
-            print(f"重新取得 {date} 結算價中 ... {retry+1}/{MAX_RETRIES}")
+            print(f"重新取得 {date} 結算價中 ({e})... {retry+1}/{MAX_RETRIES}")
             sleep(3)
     else:
         print(f"取得 {date} 結算價失敗")
@@ -244,17 +304,20 @@ if __name__ == "__main__":
     print(f"Excel 最新日期為 {excel_latest_date}")
 
     dates_30 = get_previous_30_trading_days()
-    # dates_30 = ['2024/07/12', '2024/07/11', '2024/07/10', '2024/07/09', '2024/07/08', '2024/07/05', '2024/07/04', '2024/07/03', '2024/07/02', '2024/07/01', '2024/06/28', '2024/06/27', '2024/06/26', '2024/06/25', '2024/06/24', '2024/06/21', '2024/06/20', '2024/06/19', '2024/06/18', '2024/06/17', '2024/06/14', '2024/06/13', '2024/06/12', '2024/06/11', '2024/06/07', '2024/06/06', '2024/06/05', '2024/06/04', '2024/06/03', '2024/05/31']
+
     if excel_latest_date.strftime("%Y/%m/%d") not in dates_30:
         print(f"Excel 最新日期為 {excel_latest_date}, 已超過 30 天內能取得之資料")
         os._exit(1)
+
+    twse_dict = get_twse_open_close(dates_30)
+    #twse_dict = {'2024/08/01': {'open': '22546', 'close': '22642'}, '2024/08/02': {'open': '22141', 'close': '21638'}, '2024/07/01': {'open': '23042', 'close': '23058'}, '2024/07/02': {'open': '23012', 'close': '22879'}, '2024/07/03': {'open': '23009', 'close': '23172'}, '2024/07/04': {'open': '23360', 'close': '23522'}, '2024/07/05': {'open': '23532', 'close': '23556'}, '2024/07/08': {'open': '23550', 'close': '23878'}, '2024/07/09': {'open': '23888', 'close': '23900'}, '2024/07/10': {'open': '23744', 'close': '24007'}, '2024/07/11': {'open': '24242', 'close': '24390'}, '2024/07/12': {'open': '23955', 'close': '23916'}, '2024/07/15': {'open': '23927', 'close': '23879'}, '2024/07/16': {'open': '23880', 'close': '23997'}, '2024/07/17': {'open': '23827', 'close': '23769'}, '2024/07/18': {'open': '23373', 'close': '23398'}, '2024/07/19': {'open': '23228', 'close': '22869'}, '2024/07/22': {'open': '22818', 'close': '22256'}, '2024/07/23': {'open': '22514', 'close': '22871'}, '2024/07/26': {'open': '22206', 'close': '22119'}, '2024/07/29': {'open': '22321', 'close': '22164'}, '2024/07/30': {'open': '22040', 'close': '22223'}, '2024/07/31': {'open': '22088', 'close': '22199'}, '2024/06/03': {'open': '21388', 'close': '21536'}, '2024/06/04': {'open': '21513', 'close': '21356'}, '2024/06/05': {'open': '21385', 'close': '21484'}, '2024/06/06': {'open': '21856', 'close': '21902'}, '2024/06/07': {'open': '21823', 'close': '21858'}, '2024/06/11': {'open': '21984', 'close': '21792'}, '2024/06/12': {'open': '21841', 'close': '22048'}, '2024/06/13': {'open': '22217', 'close': '22312'}, '2024/06/14': {'open': '22311', 'close': '22504'}, '2024/06/17': {'open': '22468', 'close': '22496'}, '2024/06/18': {'open': '22690', 'close': '22757'}, '2024/06/19': {'open': '22858', 'close': '23209'}, '2024/06/20': {'open': '23196', 'close': '23406'}, '2024/06/21': {'open': '23193', 'close': '23253'}, '2024/06/24': {'open': '23124', 'close': '22813'}, '2024/06/25': {'open': '22695', 'close': '22875'}, '2024/06/26': {'open': '22938', 'close': '22986'}, '2024/06/27': {'open': '22859', 'close': '22905'}, '2024/06/28': {'open': '22896', 'close': '23032'}}
 
     for _d in dates_30[::-1]:
         current_date = datetime.strptime(_d, "%Y/%m/%d")
         if current_date <= excel_latest_date:
             continue
         current_date_str = current_date.strftime("%Y_%m_%d")
-        print(f"執行日期: {current_date_str}".ljust(80, "="))
+        print(f"執行日期: {current_date_str} ".ljust(80, "="))
 
         zip_filename = f"OptionsDaily_{current_date_str}.zip"
         get_option_daily_zip(zip_filename)
@@ -263,8 +326,8 @@ if __name__ == "__main__":
         week_code_for_0900, week_code_for_1330 = get_week_code(current_date)
 
         csv_filename = f"Options/OptionsDaily_{current_date_str}.csv"
-        call_strike_0900, call_deal_0900, put_strike_0900, put_deal_0900 = get_call_and_put(OPEN_TIME, week_code_for_0900, csv_filename)
-        call_strike_1330, call_deal_1330, put_strike_1330, put_deal_1330 = get_call_and_put(CLOSE_TIME, week_code_for_1330, csv_filename)
+        call_strike_0900, call_deal_0900, put_strike_0900, put_deal_0900 = get_call_and_put(_d, "open", week_code_for_0900, csv_filename, twse_dict, TIME_090000)
+        call_strike_1330, call_deal_1330, put_strike_1330, put_deal_1330 = get_call_and_put(_d, "close", week_code_for_1330, csv_filename, twse_dict, TIME_133000)
 
         print(f"{put_strike_0900=}")
         print(f"{put_deal_0900=}")
@@ -333,15 +396,23 @@ if __name__ == "__main__":
         sheet[f"J{write_row+1}"].font = font
         sheet[f"J{write_row+1}"].number_format = "0.0"
 
+        wb.save("Options.xlsx")
+
         if current_date.weekday() == 2: # 如果是星期三則要多寫回 結算價
             row_for_settlement = write_row
             settlement_price = get_settlement_price(current_date)
             while sheet[f"E{row_for_settlement}"].value == week_code_for_0900:
-                C_settlement_price = settlement_price - int(sheet[f"H{row_for_settlement}"].value)
-                if C_settlement_price <= 0: C_settlement_price = 0
+                try:
+                    C_settlement_price = settlement_price - int(sheet[f"H{row_for_settlement}"].value)
+                    if C_settlement_price <= 0: C_settlement_price = 0
+                except:
+                    C_settlement_price = None
 
-                P_settlement_price = int(sheet[f"I{row_for_settlement}"].value) - settlement_price
-                if P_settlement_price <= 0: P_settlement_price = 0
+                try:
+                    P_settlement_price = int(sheet[f"I{row_for_settlement}"].value) - settlement_price
+                    if P_settlement_price <= 0: P_settlement_price = 0
+                except:
+                    P_settlement_price = None
 
                 sheet[f"F{row_for_settlement}"].value = C_settlement_price
                 sheet[f"F{row_for_settlement}"].alignment = alignment
@@ -352,19 +423,14 @@ if __name__ == "__main__":
                 sheet[f"K{row_for_settlement}"].alignment = alignment
                 sheet[f"K{row_for_settlement}"].font = font
                 sheet[f"K{row_for_settlement}"].number_format = "General"
-
-
-                print(current_date)
-                print(type(current_date))
-                print(sheet[f"A{row_for_settlement}"].value)
-                print(type(sheet[f"A{row_for_settlement}"].value))                
+            
                 if current_date == sheet[f"A{row_for_settlement}"].value: # 加入下邊框
                     for col in range(1, 13):
                         sheet.cell(row=row_for_settlement, column=col).border = Border(bottom=Side(style='thin'))
 
                 row_for_settlement = row_for_settlement - 1
 
-        wb.save("Options.xlsx")
+            wb.save("Options.xlsx")
 
         write_row = write_row + 2
 
